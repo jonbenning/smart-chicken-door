@@ -27,9 +27,15 @@ class ChickenDoor:
 
     # setup pins for esp32-32s
     self.led = Pin(2,Pin.OUT)
+    self.activity_led = Pin(19,Pin.OUT)
+    self.activity_led.value(1)
     self.en = Pin(14,Pin.OUT)
     self.m1 = Pin(27,Pin.OUT)
     self.m2 = Pin(26,Pin.OUT)
+
+    #ensure the enable pin is off, incase of poorly timed reset.
+    self.en.value(0)
+
     # Determines if the door is in auto mode or manual
     self.mode_switch = Pin(25,Pin.IN,Pin.PULL_UP)
     # close_limit stops the motor when closing - normally closed
@@ -44,46 +50,234 @@ class ChickenDoor:
     self.manual_close = Pin(4,Pin.IN,Pin.PULL_UP)
     self.i2c = I2C(scl=Pin(5), sda=Pin(18))
 
-    if self.mode_switch.value() == 0:
-      self.mode = "auto"
-    elif self.mode_switch.value() == 1:
-      self.mode = "manual"
-
-
-    _thread.start_new_thread(self.mode_monitor,())
-
     self.load_config()
-    self.setup_logger()
-    self.blink_freq = 0.1
-    self.operation = None
-    self.next_operation_time = None
+    if self.json_config is None:
+      self.update_config()
 
-    _thread.start_new_thread(self.blink,())
-    if self.mode == "manual":
-      _thread.start_new_thread(self.input_monitor,())
+    else:
+      # Check if the open button is being held at startup...
+      if self.manual_open.value() == 0:
+        #self.wifi_connect()
+        self.update_config()
+        
+      else:
+        if self.mode_switch.value() == 0:
+          self.mode = "auto"
+        elif self.mode_switch.value() == 1:
+          self.mode = "manual"
 
-    self.wifi_connect()
 
-    if self.mode == "auto":
-      #Set the RTC to NTP...
-      while True:
-        try:
-          ntptime.settime()
-          break
-        except:
-          print("error setting RTC. Retrying...")
-          sleep(1)
+        _thread.start_new_thread(self.mode_monitor,())
+
+        self.load_config()
+        self.setup_logger()
+        self.blink_freq = 0.1
+        self.operation = None
+        self.next_operation_time = None
+
+        _thread.start_new_thread(self.blink,())
+        if self.mode == "manual":
+          _thread.start_new_thread(self.input_monitor,())
+
+
+        elif self.mode == "auto":
+          #Connect to Wifi
+          self.wifi_connect()
+          #Set the RTC to NTP...
+          while True:
+            try:
+              ntptime.settime()
+              break
+            except:
+              print("error setting RTC. Retrying...")
+              sleep(1)
   
 
-      #Set the sunrise/sunset attributes
-      _thread.start_new_thread(self.get_sunrise_sunset,())
-      gc.collect()
+          #Set the sunrise/sunset attributes
+          _thread.start_new_thread(self.get_sunrise_sunset,())
+          gc.collect()
 
-      #Start the thread to watch the clock
-      _thread.start_new_thread(self.time_monitor,())
+          #Start the thread to watch the clock
+          _thread.start_new_thread(self.time_monitor,())
 
-    # check for a state file and set
-    self.target = self.get_target_state()
+        # check for a state file and set
+        self.target = self.get_target_state()
+
+  def build_html_form(self,message=""):
+    config = {} 
+    if getattr(self,"json_config",None):
+      if self.json_config.get('wifi',None):
+        ssid = self.json_config['wifi'].get('ssid',"")
+        passphrase = self.json_config['wifi'].get('passphrase',"")
+      else:
+        ssid = ""
+        passphrase = ""
+ 
+      if self.json_config.get('location',None):
+        lat = self.json_config['location'].get('lat',"")
+        lng = self.json_config['location'].get('lng',"")
+      else:
+        lat = ""
+        lng = ""
+
+      if self.json_config.get('time',None):
+        sunrise_offset = int(self.json_config['time'].get('sunrise_offset',"0"))
+        sunset_offset = int(self.json_config['time'].get('sunset_offset',"0"))
+      else:
+        sunrise_offset = "0"
+        sunset_offset = "0"
+
+      if self.json_config.get('pushover',None):
+        app_token = self.json_config['pushover'].get('app_token',"")
+        group_key = self.json_config['pushover'].get('group_key',"")
+      else:
+        app_token = ""
+        group_key = ""
+
+    else:
+      ssid = ""
+      passphrase = ""
+      lat = ""
+      lng = ""
+      sunrise_offset = "0"
+      sunset_offset = "0"
+      app_token = ""
+      group_key = ""
+
+
+    html_list = [
+    "<!DOCTYPE html>",
+    "<html>",
+    "<head>",
+      "<title>Update Chicken Coop Config</title>",
+    "</head>",
+    "<link rel='icon' href='data:;base64,='>  <!-- para evitar 2 conexiones, http y favicon -->",
+    "<center><h2>Chicken Coop Config</h2></center>",
+    "<form action='/' method='POST'><center>",
+      "<table cellspacing='5px' cellpadding='5%' align='center'>",
+        "<tr>",
+          "<td align='right'>Wireless SSID:</td>",
+          "<td><input type='text' name='ssid' placeholder='ssid' value='{0}'></td>".format(ssid),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Wireless Passphrase:</td>",
+          "<td><input type='text' name='passphrase' placeholder='Wifi passphrase' value='{0}'></td>".format(passphrase),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Latitude:</td>",
+          "<td><input type='text' name='lat' placeholder='Decimal Latitude' value='{0}'></td>".format(lat),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Longitude:</td>",
+          "<td><input type='text' name='lng' placeholder='Decimal Longitude' value='{0}'></td>".format(lng),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Sunrise Offset:</td>",
+          "<td><input type='text' name='sunrise_offset' placeholder='0' value='{0}'></td>".format(sunrise_offset),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Sunset Offset:</td>",
+          "<td><input type='text' name='sunset_offset' placeholder='0' value='{0}'></td>".format(sunset_offset),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Pushover App Token:</td>",
+          "<td><input type='text' name='app_token' placeholder='Pushover App Token' value='{0}'></td>".format(app_token),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Pushover Group Key:</td>",
+          "<td><input type='text' name='group_key' placeholder='Pushover Group or user key' value='{0}'></td><br>".format(group_key),
+        "</tr>",
+        "<tr>",
+          "<td><button type='submit' name='save' value='save'>Save Configuration</button></td>",
+          "<td><button type='submit' name='reset' value='reset'>Reset Device</button></td>",
+        "</tr>",
+        "<tr>",
+          "<td colspan='2'><h3>{0}</h3></td>".format(message),
+        "</tr>",
+      "</table>",
+    "</center></form>",
+    "</html>",
+    ]
+    
+    html_string = "\n".join(html_list)
+    return html_string
+    
+
+    
+
+  def update_config(self):
+    _thread.start_new_thread(self.update_reset_monitor,())
+    from microdot import Microdot,redirect,send_file,Response
+    app = Microdot()
+
+    ap_ssid = 'ChickenCoup-ConfigMode'
+    ap_password = '123456789'
+    
+    ap = network.WLAN(network.AP_IF)
+    ap.active(True)
+    ap.config(essid=ap_ssid, password=ap_password)
+
+    @app.route("/", methods=['GET','POST'])    
+    def index(request):
+      #form_cookie= None
+      #message_cookie = None
+      if request.method == "GET":
+        #print(dir(request))
+        #print(request.form)
+        #print(request.headers)
+        return Response(body=self.build_html_form(),headers={"Content-Type": "text/html"})
+      elif request.method == "POST":
+        if request.form.get('save',None):
+          ## they clicked save config. write the dict to flash as a json file...
+          print(request.form)
+          new_config = {
+            "wifi": {
+              "ssid": request.form['ssid'],
+              "passphrase": request.form['passphrase']
+             },
+             "location": {
+               "lat": request.form['lat'],
+               "lng": request.form['lng']
+             },
+             "time": {
+               "sunrise_offset": request.form['sunrise_offset'],
+               "sunset_offset": request.form['sunset_offset']
+             },
+             "pushover": {
+               "app_token": request.form['app_token'],
+               "group_key": request.form['group_key']
+             }
+          }
+
+          print(new_config)
+          with open("config.json",'w',encoding = 'utf-8') as f:
+            print("Saving configuration to config.json...")
+            f.write(json.dumps(new_config))
+            print("Done!")
+
+
+          self.json_config = new_config
+          return Response(body=self.build_html_form(message="Updated Configuration!"),headers={"Content-Type": "text/html"})
+
+
+        elif request.form.get('reset',None):
+          ## They clicked on reset! Reset the device!
+          self.update_reset_scheduled = True
+          return send_file('reset.html')
+          
+    app.run(debug=True)
+
+
+  def update_reset_monitor(self):
+    ## only really used by the update config function
+    ## this background thread will reset the device 5s after
+    ## a variable flag is detected. This allows an http response
+    ## to be sent, avoiding errors in the browser...
+    while True:
+      if getattr(self,'update_reset_scheduled',None):
+        sleep(5)
+        reset()
+
 
   def setup_logger(self):
     logging.basicConfig(level=logging.INFO)
@@ -92,12 +286,17 @@ class ChickenDoor:
   def blink(self):
     while True:
       if self.blink_freq:
-        self.led.on()
+        self.led.value(1)
+        self.activity_led.value(1)
+        #print("led ON")
         sleep(self.blink_freq)
-        self.led.off()
+        self.led.value(0)
+        self.activity_led.value(0)
+        #print("led OFF")
         sleep(self.blink_freq)
       else:
-        self.led.off()
+        self.led.value(0)
+        self.activity_led.value(0)
 
   def mode_monitor(self):
     while True:
@@ -113,27 +312,36 @@ class ChickenDoor:
   def time_monitor(self):
     while True:
       if self.next_operation_time:
+        time_till_operation = ((self.next_operation_time - utime.time()))
         door_status = self.check_limits()
         if utime.time() > self.next_operation_time:
           if self.next_operation == "open":
             if door_status['actual'] != "open":
               self.open()
+            #else:
+            #  self.standby(duration=time_till_operation)
           elif self.next_operation == "close":
             if door_status['actual'] != "closed":
               self.close()
+            #else:
+            #  self.standby(duration=time_till_operation)
           else:
             # This shouldnt happen. its here for completeness
             print("errmagherd, something is wrong")
 
-        else:
-          #print("not time to open/close the door, but validate its the opposite of the next operation")
-          time_till_operation = ((self.next_operation_time - utime.time()))
-          minutes_total = int(time_till_operation / 60)
-          sec_remainder = int(time_till_operation % 60)
-          hours_until = int(minutes_total / 60)
-          min_remainer = int(minutes_total % 60)
+          ## Update the next_operation_time using this offset...
+          self.calculate_next_operation(offset=1)
 
-          print("Its {0}:{1}:{2} until the next operation".format(hours_until,min_remainer,sec_remainder))
+          time_till_operation = ((self.next_operation_time - utime.time()))
+
+          #hours,minutes_remainder,seconds_remainder = self.convert_time(time_till_operation)
+          print("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
+          self.standby(duration=time_till_operation)
+
+        else:
+          #hours,minutes_remainder,seconds_remainder = self.convert_time(time_till_operation)
+          #print("Its {0}:{1}:{2} until the next operation".format(hours,minutes_remainder,seconds_remainder))
+          print("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
           if self.next_operation == "open":
             if door_status['actual'] != "closed":
               # The door should be shut right now! Close it!
@@ -142,6 +350,11 @@ class ChickenDoor:
             if door_status['actual'] != "open":
               # The door should be open right now! Open it!
               self.open()
+          
+          #hours,minutes_remainder,seconds_remainder = self.convert_time(time_till_operation)
+          #print("Its {0}:{1}:{2} until the next operation".format(hours,minutes_remainder,seconds_remainder))
+          #print("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
+          self.standby(duration=time_till_operation)
         sleep(60)
       else:
         print("waiting for sunset/sunrise data...")
@@ -155,11 +368,11 @@ class ChickenDoor:
 
   def api_request(self,day):
     print("Querying sunrise-sunset.org for {0}".format(day))
-    print("mem before request: {0}".format(gc.mem_free()))
+    #print("mem before request: {0}".format(gc.mem_free()))
     api_url = "https://api.sunrise-sunset.org/json?lat={0}&lng={1}&formatted=0&date={2}".format(self.lat,self.lng,day)
     if self.sta_if.isconnected():
       response = urequests.get(url=api_url)
-      print("mem after request: {0}".format(gc.mem_free()))
+      #print("mem after request: {0}".format(gc.mem_free()))
       gc.collect()
       return response.json()
     else:
@@ -168,64 +381,85 @@ class ChickenDoor:
         print("Waiting for connection to activate...")
         if  self.sta_if.isconnected():
           response = urequests.get(url=api_url)
-          print("mem after request: {0}".format(gc.mem_free()))
+          #print("mem after request: {0}".format(gc.mem_free()))
           return response.json()
         #sleep(1)
+ 
+  def convert_time(self,seconds):
+    minutes = int(seconds / 60)
+    seconds_remainder = int(seconds % 60)
+    hours = int(minutes / 60)
+    minutes_remainder = int(minutes % 60)
+  
+    time_str = "{:0>2d}:{:0>2d}:{:0>2d}".format(hours,minutes_remainder,seconds_remainder)
+
+    return time_str
+
       
+  def calculate_next_operation(self,offset=0):
+      self.sunrise_dict['current'] = utime.time()
 
+      print(self.sunrise_dict)
 
-  def get_sunrise_sunset(self):
-    #while True:
-      days = ("yesterday","today","tomorrow")
-
-      response_dict = {}
-      sunrise_sunset_dict = {}
-      for day in days:
-        response_dict[day] = self.api_request(day)
-
-      for day in response_dict:
-        sunrise_sunset_dict['{0}_sunrise'.format(day)] = self.convert_api_time(response_dict[day]['results']['sunrise'])
-        sunrise_sunset_dict['{0}_sunset'.format(day)] = self.convert_api_time(response_dict[day]['results']['sunset'])
-
-      # save this without current time for use elsewhere in the program
-      self.sunrise_dict = sunrise_sunset_dict
-
-      sunrise_sunset_dict['current'] = utime.time()
-
-      sorted_dates = sorted(sunrise_sunset_dict.values())
-      next_operation_index = sorted_dates.index(sunrise_sunset_dict['current'])+1
+      sorted_dates = sorted(self.sunrise_dict.values())
+      next_operation_index = sorted_dates.index(self.sunrise_dict['current'])+ 1 + offset
       next_operation_time = sorted_dates[next_operation_index]
 
-      for name,datestamp in sunrise_sunset_dict.items():
+      for name,datestamp in self.sunrise_dict.items():
         if datestamp == next_operation_time:
           print(name)
           if name.endswith("sunrise"):
             ## Open the door 2h after sunrise. allowing time for the chickens to lay eggs and stuff.
             self.next_operation = "open"
-            self.next_operation_time = (next_operation_time + self.sunrise_offset)
+            self.next_operation_time = next_operation_time
+            #self.next_operation_time = (next_operation_time + self.sunrise_offset)
           elif name.endswith("sunset"):
             ## close the door 10m before sunset
             self.next_operation = "close"
-            self.next_operation_time = (next_operation_time + self.sunset_offset)
+            self.next_operation_time = next_operation_time
+            #self.next_operation_time = (next_operation_time + self.sunset_offset)
 
-      ## Sleep for 6 hours before updating the sunset/sunrise data
-      #sleep(14400)
+  def get_sunrise_sunset(self):
+    days = ("yesterday","today","tomorrow")
+
+    response_dict = {}
+    sunrise_sunset_dict = {}
+    for day in days:
+      response_dict[day] = self.api_request(day)
+
+    for day in response_dict:
+      ## Adding the sunrise and sunset offsets to these values to make the logic more sane.
+      sunrise_sunset_dict['{0}_sunrise'.format(day)] = (
+        int(self.convert_api_time(response_dict[day]['results']['sunrise'])) + int(self.json_config['time']['sunrise_offset']))
+      sunrise_sunset_dict['{0}_sunset'.format(day)] = (
+        int(self.convert_api_time(response_dict[day]['results']['sunset'])) + int(self.json_config['time']['sunset_offset']))
+
+    # save this without current time for use elsewhere in the program
+    self.sunrise_dict = sunrise_sunset_dict
 
 
+    self.calculate_next_operation()
 
 
   def load_config(self):
-    with open("config.json","r") as w:
-      json_string = w.read()
-      json_config = json.loads(json_string)
-      self.ssid = json_config['wifi']['ssid']
-      self.passphrase = json_config['wifi']['passphrase']
-      self.lat = json_config['location']['lat']
-      self.lng = json_config['location']['lng']
-      self.sunrise_offset = int(json_config['time']['sunrise_offset'])
-      self.sunset_offset = int(json_config['time']['sunset_offset'])
-      self.app_token = json_config['pushover']['app_token']
-      self.group_key = json_config['pushover']['group_key']
+    try:
+      with open("config.json","r") as w:
+        json_string = w.read()
+        self.json_config = json.loads(json_string)
+        self.ssid = self.json_config['wifi']['ssid']
+        self.passphrase = self.json_config['wifi']['passphrase']
+        self.lat = self.json_config['location']['lat']
+        self.lng = self.json_config['location']['lng']
+        self.sunrise_offset = int(self.json_config['time']['sunrise_offset'])
+        self.sunset_offset = int(self.json_config['time']['sunset_offset'])
+        self.app_token = self.json_config['pushover']['app_token']
+        self.group_key = self.json_config['pushover']['group_key']
+    except:
+      # Config file doesnt exist! Start in AP Mode for initial configuration...
+      #self.update_config(ap_mode=True)
+      self.json_config = None
+      
+
 
   def wifi_connect(self):
     #with open("ap_config.txt","r") as w:
@@ -241,14 +475,17 @@ class ChickenDoor:
     self.sta_if.scan()                             # Scan for available access points
     self.sta_if.connect("{0}".format(ap_name.strip()), "{0}".format(ap_password.strip())) # Connect to an AP
     self.sta_if.isconnected()                      # Check for successful connection
-    while True:
+    connect_wait = 1
+    while connect_wait <= 30:
       #wait for the connection fully activate
       print("Waiting for connection to activate...")
       if  self.sta_if.isconnected():
         break
       sleep(1)
+      connect_wait += 1
     print(self.sta_if.ifconfig())
     sleep(5)
+    
 
   def reset_state(self):
     try:
@@ -268,7 +505,7 @@ class ChickenDoor:
       return open1,close1,open2,close2
 
 
-  def close(self,duration=None,attempt=0):
+  def close(self,notify=True,duration=None,attempt=0):
     gc.collect()
     if duration:
       close_time = utime.time() + duration
@@ -303,19 +540,22 @@ class ChickenDoor:
       ##################################
 
       ## if an obstuction is encountered, back off and retry, up to 3 times.
-      ## then just open.TODO: send push notification!
+      ## then just open.
       if self.obstruction_limit.value() == 1:
         self.en.value(0)
         self.log.info("Obstruction encountered! back off the door a little!")
         
-        if attempt < 1:
-          self.open(duration=3)
+        if attempt < 2:
+          self.open(notify=False,duration=4)
           attempt += 1
-          self.close(attempt=attempt)
+          self.close(notify=notify,attempt=attempt)
         else:
-          #print("Sending notification...")
-          _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Check the door!"))
-          self.open()
+          if notify:
+            #print("Sending notification...")
+            _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Check the door!"))
+          else:
+            print("skipping notification...")
+          self.open(notify=False)
           
         return 1 # rc 1 means the obstruction switch was tripped
 
@@ -328,8 +568,11 @@ class ChickenDoor:
       if self.close_limit.value() == 1:
         self.en.value(0)
         self.log.info("Door Closed!")
-        #print("Sending notification...")
-        _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Closed!"))
+        if notify:
+          print("Sending notification...")
+          _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Closed!"))
+        else:
+          print("skipping notification...")
         break
 
     self.en.value(0)
@@ -337,7 +580,7 @@ class ChickenDoor:
     sleep(0.5)
     return 0 # rc 0 means the door was shut
 
-  def open(self,duration=None):
+  def open(self,notify=True,duration=None):
     gc.collect()
     if duration:
       open_time = utime.time() + duration
@@ -381,8 +624,11 @@ class ChickenDoor:
       if self.open_limit.value() == 1:
         self.en.value(0)
         self.log.info("Door Opened!")
-        #print("Sending notification...")
-        _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Opened!"))
+        if notify:
+          #print("Sending notification...")
+          _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Opened!"))
+        else:
+          print("skipping notification...")
         break
 
     self.en.value(0)
@@ -399,6 +645,7 @@ class ChickenDoor:
         headers = {'Content-Type': 'application/json'}
         json_data = json.dumps({'token': token,"user": user,"message": message})
         response = urequests.post(url=pushover_url,headers=headers,data=json_data)
+        print(response.status_code)
         return response
         break
       except:
@@ -409,7 +656,8 @@ class ChickenDoor:
   def input_monitor(self):
     print("Started monitoring for user input")
     self.log.info("Started monitoring for user input")
-    while True:
+    timeout = utime.time() + (60)
+    while utime.time() <= timeout:
       open1,close1,open2,close2 = self.read_switches()
 
       open_press = None
@@ -426,11 +674,17 @@ class ChickenDoor:
         close_press = False
      
       if open_press and not close_press:
-        self.open()
+        self.open(notify=False)
+        timeout = utime.time() + (60)
       elif close_press and not open_press:
-        self.close()
+        self.close(notify=False)
+        timeout = utime.time() + (60)
       elif open_press and close_press:
         self.reset_state()
+        timeout = utime.time() + (60)
+
+    self.standby()
+
 
   def i2c_scan(self):
     devices = self.i2c.scan()
@@ -442,20 +696,6 @@ class ChickenDoor:
     
       for device in devices:  
         print("Decimal address: ",device," | Hexa address: ",hex(device))
-
-  def read_sensors(self):
-    lux_sensor = max44009.MAX44009(self.i2c)
-    bme_sensor = bme280.BME280(i2c=self.i2c)
-
-    #bme.sealevel = 101019
-    values = bme_sensor.values
-    sensor_data = {
-      'lux': lux_sensor.illuminance_lux,
-      'temperature': values[0],
-      'pressure': values[1],
-      'humidity': values[2]
-    }
-    return sensor_data
 
   def get_target_state(self):
     try:
@@ -557,12 +797,32 @@ class ChickenDoor:
       print("Target isn't defined. Closing the door as default.")
       self.close()
 
+  def standby(self,duration=None):
+    #duration should be in seconds    
+
+    #level parameter can be: esp32.WAKEUP_ANY_HIGH or esp32.WAKEUP_ALL_LOW
+    esp32.wake_on_ext0(pin = self.manual_open, level = esp32.WAKEUP_ALL_LOW)
+    
+    # Couldnt get ext1 with two wakeup switches to work. leave it here for knowledge...
+    esp32.wake_on_ext1(pins=[self.manual_close], level=esp32.WAKEUP_ALL_LOW)
+    #esp32.wake_on_ext1(pins = [self.manual_open, self.manual_close], level = esp32.WAKEUP_ALL_LOW)
+    
+    
+    ###  1000 * 60 * 10 = 10m in milliseconds
+    if duration:
+      print('Going to sleep in 30s in case there are any pending threads...')
+      sleep(30)
+      print('Going to sleep now...')
+      sleepytime =  duration * 1000
+      deepsleep(sleepytime)
+    else:
+      # no duration specified, go into deepsleep indefinitely
+      print('Going to sleep now...')
+      deepsleep()
+
 
 door = ChickenDoor()
 door.blink_freq = 0.5
-
-print(door.read_sensors())
-print(door.check_limits())
 
 while True:
   # Waiting for things to happen

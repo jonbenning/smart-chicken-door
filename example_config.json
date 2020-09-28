@@ -1,0 +1,19 @@
+{
+    "wifi": {
+        "ssid": "my_ap_name",
+        "passphrase": "my wifi password"
+    },
+    "location": {
+        "lat": "45.0000",
+        "lng": "-90.0000"
+    },
+    "time": {
+        "sunrise_offset": "+7200",
+        "sunset_offset": "-600"
+    },
+    "pushover": {
+        "app_token": "pushover_app_token",
+        "group_key": "pushover_group_key"
+    }
+}
+

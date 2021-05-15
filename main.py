@@ -1,14 +1,15 @@
 from machine import Pin
+from machine import PWM
 from machine import I2C
 from machine import deepsleep
 from machine import reset
+from Suntime import Sun
 import utime
 import ntptime
 from time import sleep, sleep_ms
+from time import sleep, sleep_us
 import sys
 import os
-import max44009
-import bme280_float as bme280
 import esp32
 import network
 import _thread
@@ -29,15 +30,14 @@ class ChickenDoor:
     self.led = Pin(2,Pin.OUT)
     self.activity_led = Pin(19,Pin.OUT)
     self.activity_led.value(1)
-    self.en = Pin(14,Pin.OUT)
-    self.m1 = Pin(27,Pin.OUT)
-    self.m2 = Pin(26,Pin.OUT)
 
-    #ensure the enable pin is off, incase of poorly timed reset.
-    self.en.value(0)
+    self.slp = Pin(14,Pin.OUT,None)
+    self.stp = Pin(27,Pin.OUT) #step when stepper mode
+    self.dir = Pin(26,Pin.OUT) #dir when stepper mode
 
     # Determines if the door is in auto mode or manual
     self.mode_switch = Pin(25,Pin.IN,Pin.PULL_UP)
+
     # close_limit stops the motor when closing - normally closed
     self.close_limit = Pin(32,Pin.IN,Pin.PULL_UP)
     # open_limit stops the motor when opening - normally closed
@@ -46,19 +46,27 @@ class ChickenDoor:
     # the close limit. in case theres an obstruction. The motor mount will flex
     # and touch the switch. Copied from the "ladies first" door.- normally closed
     self.obstruction_limit = Pin(35,Pin.IN,Pin.PULL_UP)
+    
+    # Setup interrupts for the limit switches
+    self.open_limit.irq(trigger=Pin.IRQ_RISING, handler=self.limit_handler)
+    self.close_limit.irq(trigger=Pin.IRQ_RISING, handler=self.limit_handler)
+    self.obstruction_limit.irq(trigger=Pin.IRQ_RISING, handler=self.limit_handler)
+
+
     self.manual_open = Pin(15,Pin.IN,Pin.PULL_UP)
     self.manual_close = Pin(4,Pin.IN,Pin.PULL_UP)
-    self.i2c = I2C(scl=Pin(5), sda=Pin(18))
 
-    self.load_config()
-    if self.json_config is None:
-      self.update_config()
 
-    else:
+    if self.load_config():
+      ## Config was successfully loaded
       # Check if the open button is being held at startup...
-      if self.manual_open.value() == 0:
-        #self.wifi_connect()
+      if ((self.manual_open.value() == 0) and (self.manual_close.value() == 1)):
         self.update_config()
+      ## holding the close button at startup puts the controller in diag mode.
+      ## it will connect to wifi and drop to a repl prompt
+      elif ((self.manual_open.value() == 1) and (self.manual_close.value() == 0)):
+        self.wifi_connect()
+        sys.exit()
         
       else:
         if self.mode_switch.value() == 0:
@@ -66,18 +74,32 @@ class ChickenDoor:
         elif self.mode_switch.value() == 1:
           self.mode = "manual"
 
+        if self.is_stepper:
+          self.slp_status = False
+          self.close_dir = True
+          self.open_dir = False
+        else:
+          pass
 
-        _thread.start_new_thread(self.mode_monitor,())
 
-        self.load_config()
+        self.mode_switch.irq(trigger=Pin.IRQ_RISING|Pin.IRQ_FALLING, handler=self.mode_callback)
+
         self.setup_logger()
         self.blink_freq = 0.1
         self.operation = None
         self.next_operation_time = None
 
         _thread.start_new_thread(self.blink,())
+
         if self.mode == "manual":
-          _thread.start_new_thread(self.input_monitor,())
+          self.manual_open.irq(trigger=Pin.IRQ_FALLING, handler=self.input_handler)
+          self.manual_close.irq(trigger=Pin.IRQ_FALLING, handler=self.input_handler)
+          self.log.info("Started monitoring for user input")
+          self.timeout = utime.time() + (60)
+          while utime.time() <= self.timeout:
+            sleep(1)
+
+          self.standby()
 
 
         elif self.mode == "auto":
@@ -89,19 +111,149 @@ class ChickenDoor:
               ntptime.settime()
               break
             except:
-              print("error setting RTC. Retrying...")
+              self.log.info("Error setting RTC. Retrying...")
               sleep(1)
+          gc.collect()
   
 
           #Set the sunrise/sunset attributes
           _thread.start_new_thread(self.get_sunrise_sunset,())
-          gc.collect()
 
           #Start the thread to watch the clock
           _thread.start_new_thread(self.time_monitor,())
 
         # check for a state file and set
         self.target = self.get_target_state()
+    else: 
+      self.update_config()
+
+
+  def input_handler(self,pin):
+
+    if self.input_sense_time:
+      pass
+    else:
+      self.input_sense_count += 1
+      self.input_sense_time = utime.ticks_ms() + 5
+
+    if ((utime.ticks_ms() < self.input_sense_time) and (self.input_sense_count > 1)):
+      # this irq is detected during debounce time of 5ms
+      pass
+    else:
+      if pin == self.manual_open:
+        if self.manual_open.value() == 0:
+          self.operation = "open"
+          self.slp_status = not self.slp_status
+          if self.slp_status:
+            self.open(notify=False)
+          else:
+            self.disable_motor()
+
+      elif pin == self.manual_close:
+        if self.manual_close.value() == 0:
+          self.operation = "close"
+          self.slp_status = not self.slp_status
+          if self.slp_status:
+            self.close(notify=False)
+          else:
+            self.disable_motor()
+
+      #enable_irq(self.input_irq_status)
+      self.limit_sense_time = None
+      self.limit_sense_count = 0
+      self.timeout = utime.time() + (60)
+
+
+  def limit_handler(self,pin):
+    if self.limit_sense_time:
+      pass
+    else:
+      self.limit_sense_count += 1
+      self.limit_sense_time = utime.ticks_ms() + 5
+
+    if ((utime.ticks_ms() < self.limit_sense_time) and (self.limit_sense_count > 1)):
+      # this irq is detected during debounce time of 5ms
+      pass
+    else:
+      if pin == self.open_limit:
+        # The door is open, disable the driver!
+        if self.operation == "open":
+          self.disable_motor()
+          self.log.info("Door has been opened")
+          self.limit_sense_time = None
+          if self.mode == "auto":
+            if not self.notification_sent:
+              #_thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Opened!"))
+              self.send(self.app_token,self.group_key,"Door Opened!")
+              self.notification_sent = True
+      elif pin == self.close_limit:
+        # The door is closed, disable the driver!
+        if self.operation == "close":
+          self.disable_motor()
+          self.log.info("Door has been closed")
+          self.limit_sense_time = None
+          if self.mode == "auto":
+            if not self.notification_sent:
+              #_thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Closed!"))
+              self.send(self.app_token,self.group_key,"Door Closed!")
+              self.notification_sent = True
+      elif pin == self.obstruction_limit:
+        if self.obstruction_limit.value() == 1:
+          if self.close_attempts < 2:
+            self.limit_sense_time = None
+            # The door encountered an obstruction while closing!
+            # disable the driver, change direction, and reenable? maybe just change direction??
+            self.log.info("Hit an obstruction")
+            self.disable_motor()
+            self.dir.value(not self.dir.value())
+            self.enable_motor()
+            sleep(3)
+            self.disable_motor()
+            self.dir.value(not self.dir.value())
+            self.enable_motor()
+            self.close_attempts += 1
+          else:
+            if self.mode == "auto":
+              self.disable_motor()
+              if not self.notification_sent:
+                #self.send(self.app_token,self.group_key,"!!! Check the door !!!",1)
+                _thread.start_new_thread(self.send,(self.app_token,self.group_key,"!!! Check the door !!!",1))
+                self.notification_sent = True
+              
+            self.limit_sense_time = None
+            self.open()
+
+  def disable_motor(self):
+    self.pending_operation = False
+    self.pending_operation_time = 0
+
+    motor_freq = self.motor_max
+    if getattr(self,"pwm",None):
+      while motor_freq > self.motor_min:
+        self.pwm.freq(motor_freq)
+        motor_freq -= self.motor_ramp_steps
+        sleep_ms(self.motor_ramp_time)
+
+    if getattr(self,"pwm",None):
+      self.pwm.deinit()
+
+    self.slp.value(0)
+
+  def enable_motor(self):
+    self.slp.value(1)
+    #self.pwm = PWM(self.stp, freq=1200)
+    motor_freq = self.motor_min
+    self.pwm = PWM(self.stp, freq=motor_freq)
+    while motor_freq < self.motor_max:
+      self.pwm.freq(motor_freq)
+      motor_freq += self.motor_ramp_steps
+      sleep_ms(self.motor_ramp_time)
+    self.pending_operation = True
+    self.pending_operation_time = utime.time()
+    if self.operation == "close":
+      self.log.info("closing the door...")
+    elif self.operation == "open":
+      self.log.info("opening the door...")
 
   def build_html_form(self,message=""):
     config = {} 
@@ -133,6 +285,17 @@ class ChickenDoor:
       else:
         app_token = ""
         group_key = ""
+
+      if self.json_config.get('motor_tuning',None):
+        motor_min = int(self.json_config['motor_tuning'].get('motor_min',"500"))
+        motor_max = int(self.json_config['motor_tuning'].get('motor_max',"1100"))
+        ramp_time = int(self.json_config['motor_tuning'].get('ramp_time',"5"))
+        ramp_steps = int(self.json_config['motor_tuning'].get('ramp_steps',"10"))
+      else:
+        motor_min = 500
+        motor_max = 1100
+        ramp_time = 5
+        ramp_steps = 10
 
     else:
       ssid = ""
@@ -186,6 +349,22 @@ class ChickenDoor:
         "<tr>",
           "<td align='right'>Pushover Group Key:</td>",
           "<td><input type='text' name='group_key' placeholder='Pushover Group or user key' value='{0}'></td><br>".format(group_key),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Motor Min Frequency:</td>",
+          "<td><input type='text' name='motor_min' placeholder='Minimum motor frequency' value='{0}'></td><br>".format(motor_min),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Motor Max Frequency:</td>",
+          "<td><input type='text' name='motor_max' placeholder='Maximum motor frequency' value='{0}'></td><br>".format(motor_max),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Motor ramp steps:</td>",
+          "<td><input type='text' name='ramp_steps' placeholder='Steps increment to ramp acceleration' value='{0}'></td><br>".format(ramp_steps),
+        "</tr>",
+        "<tr>",
+          "<td align='right'>Motor ramp time:</td>",
+          "<td><input type='text' name='ramp_time' placeholder='Time in ms between ramp increments' value='{0}'></td><br>".format(ramp_time),
         "</tr>",
         "<tr>",
           "<td><button type='submit' name='save' value='save'>Save Configuration</button></td>",
@@ -246,6 +425,12 @@ class ChickenDoor:
              "pushover": {
                "app_token": request.form['app_token'],
                "group_key": request.form['group_key']
+             },
+             "motor_tuning": {
+               "motor_min": request.form['motor_min'],
+               "motor_max": request.form['motor_max'],
+               "ramp_steps": request.form['ramp_steps'],
+               "ramp_time": request.form['ramp_time'],
              }
           }
 
@@ -298,15 +483,9 @@ class ChickenDoor:
         self.led.value(0)
         self.activity_led.value(0)
 
-  def mode_monitor(self):
-    while True:
-      if self.mode == "manual":
-        if self.mode_switch.value() == 0:
-          reset()
-      elif self.mode == "auto":
-        if self.mode_switch.value() == 1:
-          reset()
-      sleep(1)
+
+  def mode_callback(self,pin):
+    reset()
         
 
   def time_monitor(self):
@@ -335,13 +514,19 @@ class ChickenDoor:
           time_till_operation = ((self.next_operation_time - utime.time()))
 
           #hours,minutes_remainder,seconds_remainder = self.convert_time(time_till_operation)
-          print("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
+          sleep(1)
+
+          while utime.time() < (self.pending_operation_time + self.operation_timeout):
+            if self.pending_operation:
+              sleep(5)
+
+          self.log.info("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
           self.standby(duration=time_till_operation)
 
         else:
           #hours,minutes_remainder,seconds_remainder = self.convert_time(time_till_operation)
           #print("Its {0}:{1}:{2} until the next operation".format(hours,minutes_remainder,seconds_remainder))
-          print("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
+          self.log.info("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
           if self.next_operation == "open":
             if door_status['actual'] != "closed":
               # The door should be shut right now! Close it!
@@ -354,36 +539,17 @@ class ChickenDoor:
           #hours,minutes_remainder,seconds_remainder = self.convert_time(time_till_operation)
           #print("Its {0}:{1}:{2} until the next operation".format(hours,minutes_remainder,seconds_remainder))
           #print("Its {0} until the next operation".format(self.convert_time(time_till_operation)))
+          while utime.time() < (self.pending_operation_time + self.operation_timeout):
+            if self.pending_operation:
+              sleep(5)
+
           self.standby(duration=time_till_operation)
+
         sleep(60)
       else:
         print("waiting for sunset/sunrise data...")
         sleep(1)
 
-  def convert_api_time(self,datestring):
-    year,month,day = map(int, datestring.split("T")[0].split("-"))
-    hours,minutes,seconds = map(int, datestring.split("T")[1].split("+")[0].split(":"))
-    dateseconds = utime.mktime((year,month,day,hours,minutes,seconds,0,0))
-    return dateseconds
-
-  def api_request(self,day):
-    print("Querying sunrise-sunset.org for {0}".format(day))
-    #print("mem before request: {0}".format(gc.mem_free()))
-    api_url = "https://api.sunrise-sunset.org/json?lat={0}&lng={1}&formatted=0&date={2}".format(self.lat,self.lng,day)
-    if self.sta_if.isconnected():
-      response = urequests.get(url=api_url)
-      #print("mem after request: {0}".format(gc.mem_free()))
-      gc.collect()
-      return response.json()
-    else:
-      while True:
-        #wait for the connection fully activate
-        print("Waiting for connection to activate...")
-        if  self.sta_if.isconnected():
-          response = urequests.get(url=api_url)
-          #print("mem after request: {0}".format(gc.mem_free()))
-          return response.json()
-        #sleep(1)
  
   def convert_time(self,seconds):
     minutes = int(seconds / 60)
@@ -395,11 +561,11 @@ class ChickenDoor:
 
     return time_str
 
-      
+     
   def calculate_next_operation(self,offset=0):
-      self.sunrise_dict['current'] = utime.time()
+      #self.sunrise_dict['current'] = utime.time()
 
-      print(self.sunrise_dict)
+      #print(self.sunrise_dict)
 
       sorted_dates = sorted(self.sunrise_dict.values())
       next_operation_index = sorted_dates.index(self.sunrise_dict['current'])+ 1 + offset
@@ -420,25 +586,33 @@ class ChickenDoor:
             #self.next_operation_time = (next_operation_time + self.sunset_offset)
 
   def get_sunrise_sunset(self):
-    days = ("yesterday","today","tomorrow")
+    sun = Sun(self.lat,self.lng,0)
 
-    response_dict = {}
     sunrise_sunset_dict = {}
+    current_time = utime.time()
+    today = utime.localtime(current_time)[:3]
+    tomorrow = utime.localtime(current_time + 86400)[:3]
+    yesterday = utime.localtime(current_time - 86400)[:3]
+    days = {
+      'yesterday': yesterday,
+      'today': today,
+      'tomorrow': tomorrow
+    }
+
     for day in days:
-      response_dict[day] = self.api_request(day)
+      sunrise = sun.get_sunrise_time(days[day])
+      sunset = sun.get_sunset_time(days[day])
+ 
 
-    for day in response_dict:
       ## Adding the sunrise and sunset offsets to these values to make the logic more sane.
-      sunrise_sunset_dict['{0}_sunrise'.format(day)] = (
-        int(self.convert_api_time(response_dict[day]['results']['sunrise'])) + int(self.json_config['time']['sunrise_offset']))
-      sunrise_sunset_dict['{0}_sunset'.format(day)] = (
-        int(self.convert_api_time(response_dict[day]['results']['sunset'])) + int(self.json_config['time']['sunset_offset']))
+      sunrise_sunset_dict['{0}_sunrise'.format(day)] = (utime.mktime(sunrise+(0,0,0)) + self.sunrise_offset)
+      sunrise_sunset_dict['{0}_sunset'.format(day)] = (utime.mktime(sunset+(0,0,0)) + self.sunset_offset)
 
-    # save this without current time for use elsewhere in the program
+    sunrise_sunset_dict['current'] = current_time
+
     self.sunrise_dict = sunrise_sunset_dict
-
-
     self.calculate_next_operation()
+
 
 
   def load_config(self):
@@ -448,16 +622,36 @@ class ChickenDoor:
         self.json_config = json.loads(json_string)
         self.ssid = self.json_config['wifi']['ssid']
         self.passphrase = self.json_config['wifi']['passphrase']
-        self.lat = self.json_config['location']['lat']
-        self.lng = self.json_config['location']['lng']
+        self.lat = float(self.json_config['location']['lat'])
+        self.lng = float(self.json_config['location']['lng'])
         self.sunrise_offset = int(self.json_config['time']['sunrise_offset'])
         self.sunset_offset = int(self.json_config['time']['sunset_offset'])
         self.app_token = self.json_config['pushover']['app_token']
         self.group_key = self.json_config['pushover']['group_key']
+        self.close_attempts = 0
+        self.is_stepper = True
+        self.invert_dir = False
+        self.limit_sense_time = None
+        self.input_sense_time = None
+        self.input_sense_count = 0
+        self.limit_sense_count = 0
+        self.pending_operation = False
+        self.pending_operation_time = 0
+        self.operation_timeout = 120
+        self.notification_sent = False
+        self.motor_min = int(self.json_config['motor_tuning']['motor_min'])
+        self.motor_max = int(self.json_config['motor_tuning']['motor_max'])
+        self.motor_ramp_time = int(self.json_config['motor_tuning']['ramp_time'])
+        self.motor_ramp_steps = int(self.json_config['motor_tuning']['ramp_steps'])
+       
+
+        #self.is_stepper = False
+        return True
     except:
       # Config file doesnt exist! Start in AP Mode for initial configuration...
       #self.update_config(ap_mode=True)
-      self.json_config = None
+      #self.json_config = None
+      return False
       
 
 
@@ -504,198 +698,77 @@ class ChickenDoor:
 
       return open1,close1,open2,close2
 
-
   def close(self,notify=True,duration=None,attempt=0):
     gc.collect()
-    if duration:
-      close_time = utime.time() + duration
-    else:
-      open_time = None
-    self.log.info("Close the door")
-    sleep(0.5)
-    with open("state.txt",'w',encoding = 'utf-8') as f:
-      f.write("closed")
-    self.m1.value(1)
-    self.m2.value(0)
-    if self.close_limit.value() == 1:
-      self.log.info("Door is already closed!")
-      return
-    else:
-      self.operation = "close"
-      self.en.value(1)
-    while True:
-      self.log.info("closing the door...")
-
-      ## Monitor buttons for input!!! ##
-      open1,close1,open2,close2 = self.read_switches()
-
-      if open1 != open2:
-        self.log.info("Close operation was manually interrupted!")
-        break
-
-      if close1 != close2:
-        self.log.info("Close operation was manually interrupted!")
-        break
-
-      ##################################
-
-      ## if an obstuction is encountered, back off and retry, up to 3 times.
-      ## then just open.
-      if self.obstruction_limit.value() == 1:
-        self.en.value(0)
-        self.log.info("Obstruction encountered! back off the door a little!")
-        
-        if attempt < 2:
-          self.open(notify=False,duration=4)
-          attempt += 1
-          self.close(notify=notify,attempt=attempt)
-        else:
-          if notify:
-            #print("Sending notification...")
-            _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Check the door!"))
-          else:
-            print("skipping notification...")
-          self.open(notify=False)
-          
-        return 1 # rc 1 means the obstruction switch was tripped
-
+    if self.is_stepper:
+      #do stepper things...
       if duration:
-        if utime.time() >= close_time:
-          self.log.info("close duration elapsed")
-          break
+        close_time = utime.time() + duration
+      else:
+        open_time = None
+      #sleep(0.5)
+      with open("state.txt",'w',encoding = 'utf-8') as f:
+        f.write("closed")
 
+      if self.invert_dir:
+        self.dir.value(not self.close_dir)
+      else:
+        self.dir.value(self.close_dir)
 
       if self.close_limit.value() == 1:
-        self.en.value(0)
-        self.log.info("Door Closed!")
-        if notify:
-          print("Sending notification...")
-          _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Closed!"))
-        else:
-          print("skipping notification...")
-        break
+        self.log.info("Door is already closed!")
+        return
+      else:
+        self.operation = "close"
+        self.enable_motor()
 
-    self.en.value(0)
-    self.operation = None
-    sleep(0.5)
-    return 0 # rc 0 means the door was shut
 
   def open(self,notify=True,duration=None):
     gc.collect()
-    if duration:
-      open_time = utime.time() + duration
-    else:
-      open_time = None
-    self.log.info("Open the door")
-    sleep(0.5)
-    with open("state.txt",'w',encoding = 'utf-8') as f:
-      f.write("open")
-    self.m1.value(0)
-    self.m2.value(1)
-    if self.open_limit.value() == 1:
-      self.log.info("Door is already open!")
-      return
-    else:
-      self.operation = "open"
-      self.en.value(1)
-    
-    while True:
-      self.log.info("opening the door")
 
-
-      ## Monitor buttons for input!!! ##
-      open1,close1,open2,close2 = self.read_switches()
-
-      if open1 != open2:
-        self.log.info("Open operation was manually interrupted!")
-        break
-
-      if close1 != close2:
-        self.log.info("Open operation was manually interrupted!")
-        break
-
-      ##################################
-
+    if self.is_stepper:
+      #do stepper things...
       if duration:
-        if utime.time() >= open_time:
-          self.log.info("open duration elapsed")
-          break
+        close_time = utime.time() + duration
+      else:
+        open_time = None
+      #sleep(0.5)
+      with open("state.txt",'w',encoding = 'utf-8') as f:
+        f.write("open")
+      ## maybe set some direction pins here????
+
+      if self.invert_dir:
+        self.dir.value(not self.open_dir)
+      else:
+        self.dir.value(self.open_dir)
 
       if self.open_limit.value() == 1:
-        self.en.value(0)
-        self.log.info("Door Opened!")
-        if notify:
-          #print("Sending notification...")
-          _thread.start_new_thread(self.send,(self.app_token,self.group_key,"Door Opened!"))
-        else:
-          print("skipping notification...")
-        break
-
-    self.en.value(0)
-    self.operation = None
-    sleep(0.5)
-    return
+        self.log.info("Door is already open!")
+        return
+      else:
+        self.operation = "open"
+        self.enable_motor()
 
 
-  def send(self,token,user,message):
-    gc.collect()
-    while True:
+
+  def send(self,token,user,message,priority=0):
+    attempts = 0
+    while attempts < 5:
+    #while True:
+      gc.collect()
       try:
         pushover_url = "https://api.pushover.net/1/messages.json"
         headers = {'Content-Type': 'application/json'}
-        json_data = json.dumps({'token': token,"user": user,"message": message})
+        json_data = json.dumps({'token': token,"user": user,"message": message, "priority": priority})
         response = urequests.post(url=pushover_url,headers=headers,data=json_data)
         print(response.status_code)
         return response
         break
       except:
         print(micropython.mem_info())
+        attempts += 1
         sleep(5)
 
-
-  def input_monitor(self):
-    print("Started monitoring for user input")
-    self.log.info("Started monitoring for user input")
-    timeout = utime.time() + (60)
-    while utime.time() <= timeout:
-      open1,close1,open2,close2 = self.read_switches()
-
-      open_press = None
-      close_press = None
-      
-      if open1 != open2:
-        open_press = True
-      else:
-        open_press = False
-    
-      if close1 != close2:
-        close_press = True
-      else:
-        close_press = False
-     
-      if open_press and not close_press:
-        self.open(notify=False)
-        timeout = utime.time() + (60)
-      elif close_press and not open_press:
-        self.close(notify=False)
-        timeout = utime.time() + (60)
-      elif open_press and close_press:
-        self.reset_state()
-        timeout = utime.time() + (60)
-
-    self.standby()
-
-
-  def i2c_scan(self):
-    devices = self.i2c.scan()
-    
-    if len(devices) == 0:
-      print("No i2c device !")
-    else:
-      print('i2c devices found:',len(devices))
-    
-      for device in devices:  
-        print("Decimal address: ",device," | Hexa address: ",hex(device))
 
   def get_target_state(self):
     try:
@@ -715,7 +788,7 @@ class ChickenDoor:
 
   def check_limits(self):
     '''
-    One of the limit switches should be open,and one closed. Planning on using normally closed
+    One of the limit switches should be open,and one closed. Planning on using normally close
     switches. If both are closed,that means the door is neither fully open nor fully closed. 
     if both are open, that condition should not be possible, and probably means some kind of fault.
     '''
@@ -798,6 +871,7 @@ class ChickenDoor:
       self.close()
 
   def standby(self,duration=None):
+    #self.slp.init(Pin.PULL_HOLD)
     #duration should be in seconds    
 
     #level parameter can be: esp32.WAKEUP_ANY_HIGH or esp32.WAKEUP_ALL_LOW
@@ -828,5 +902,5 @@ while True:
   # Waiting for things to happen
   gc.collect()
   gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
-  sleep(5)
+  sleep(1)
 
